@@ -8,6 +8,7 @@ import random
 import copy
 import numpy as np
 from pprint import pprint
+import time
 
 import torch
 import torch.nn as nn
@@ -70,7 +71,7 @@ device = torch.device("cuda" if use_cuda else "cpu")
 cudnn.benchmark = True
 
 # same to torchvision.datasets.CIFAR10 class, but data has been split by num_meta
-meta_train_dataset, train_dataset, test_dataset = build_dataset(args.dataset, args.num_meta)
+train_meta_dataset, train_dataset, test_dataset = build_dataset(args.dataset, args.num_meta)
 
 # make imbalanced data
 torch.manual_seed(args.seed)
@@ -96,18 +97,22 @@ imb_train_dataset.data = np.delete(train_dataset.data, idx_to_del, axis=0)
 imb_train_dataset.targets = np.delete(train_dataset.targets, idx_to_del, axis=0)
 
 # imb_train/valid_meta/test
-imbalanced_train_loader = DataLoader(imb_train_dataset, batch_size=args.batch_size, shuffle=True, **kwargs)
-validation_loader = DataLoader(meta_train_dataset, batch_size=args.batch_size, shuffle=True, **kwargs)
-test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, **kwargs)
-
+imbalanced_train_loader = DataLoader(imb_train_dataset,
+                                     batch_size=args.batch_size,
+                                     shuffle=True, **kwargs)
+valid_loader = DataLoader(train_meta_dataset,  # 总共 10*10=100
+                          batch_size=args.batch_size,  # 100
+                          shuffle=True, **kwargs)
+test_loader = DataLoader(test_dataset,
+                         batch_size=args.batch_size,
+                         shuffle=False, **kwargs)
 print('load imb dataset done!')
-
-# todo: 得到 vnet 模型后，我们再 load 绘制 loss-weight curve
 
 if __name__ == '__main__':
     # 定义 2个 model
     # classifier: meta ResNet32
     model = build_model(args.dataset).cuda()
+    meta_model = build_model(args.dataset).cuda()
     optimizer_a = torch.optim.SGD(model.params(), args.lr,  # lr 阶段性变化
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
@@ -139,12 +144,14 @@ if __name__ == '__main__':
         # 调整 classifier optimizer 的 lr = meta_lr
         adjust_learning_rate(args.lr, optimizer_a, epoch)
 
+        t1 = time.time()
         # meta train on (imb_train_data, meta_data)
-        train_mw(imbalanced_train_loader, validation_loader,
+        train_mw(imbalanced_train_loader, valid_loader,
                  model, vnet,
-                 args.lr, args.dataset,
+                 args.lr,
                  optimizer_a, optimizer_c,
                  epoch, args.print_freq, writer)
+        print('batch time:', time.time() - t1)
 
         # save vnet loss-weight map each epoch
         with torch.no_grad():

@@ -4,6 +4,7 @@ import time
 
 from net.resnet import build_model
 from utils import AverageMeter, to_var
+import copy
 
 
 def adjust_learning_rate(lr, optimizer, epoch):
@@ -76,19 +77,18 @@ def validate(val_loader, model, criterion,
 
 
 # Meta-Wegiht-Net
-def train_mw(train_loader, validation_loader,
+def train_mw(train_loader, valid_loader,
              model, vnet,
-             lr, dataset,
+             lr,
              optimizer_a, optimizer_c,
              epoch, print_freq, writer):
     """
     Train for one epoch on the training set
     @param train_loader:        imbalanced train data loader
-    @param validation_loader:   meta data loader
+    @param valid_loader:   meta data loader
     @param model:   classifier
     @param vnet:    weight net
     @param lr:      args.lr, initial set lr
-    @param dataset: build_model(dataset)
     @param optimizer_a: 优化 classifier
     @param optimizer_c: 优化 VNet
     @param epoch:
@@ -104,6 +104,8 @@ def train_mw(train_loader, validation_loader,
 
     begin_step = (epoch - 1) * len(train_loader)
 
+    total_t = 0
+
     for i, (input, target) in enumerate(train_loader):
         input_var = to_var(input, requires_grad=False)
         target_var = to_var(target, requires_grad=False)
@@ -111,15 +113,21 @@ def train_mw(train_loader, validation_loader,
         # ---------------------
         # Formulating learning manner of classifier network
 
-        # build resnet32, meta_model 和 model 结构一样，load_state_dict 正常
-        # 先用 meta_model copy 一份 model 参数，在 train data 上更新后，再用 task 上的更新来更新 vnet params
+        # meta_model 和 model 结构一样
+        # meta_model copy 当前 model 参数，在 train data 上更新后，再在 meta data 上的更新 vnet params
         # 更新完 vnet params，再用 new weight 来实际计算 model 的更新
-        meta_model = build_model(dataset).cuda()
-        meta_model.load_state_dict(model.state_dict())
 
-        # inner model, 求 y_hat，计算 loss
+        # meta_model = build_model('cifar100').cuda()
+        # meta_model.load_state_dict(model.state_dict())
+
+        meta_model = copy.deepcopy(model)  # 0.02045273780822754
+
+        # t1 = time.time()
+
         y_f_hat = meta_model(input_var)  # [100,10] batch_size=100
-        cost = F.cross_entropy(y_f_hat, target_var, reduce=False)  # [100,1], reduce 不用 elementwise_mean
+        # 考虑用此作为 vnet 输入?
+
+        cost = F.cross_entropy(y_f_hat, target_var, reduction='none')  # [100,1], 不用 elementwise_mean
         cost_v = torch.reshape(cost, (len(cost), 1))  # _v 表示作为 vnet 输入
 
         # weight = vnet(loss)
@@ -130,14 +138,16 @@ def train_mw(train_loader, validation_loader,
         # weighted loss, vnet 已经引入了计算图
         l_f_meta = torch.sum(cost_v * v_lambda_norm)
 
-        # 没有直接 l_f_meta.backwards(), 这样会一并更新 vnet
-        # 因为想只更新 meta_model.params()
-        meta_model.zero_grad()  # set meta_model gradients to zero.
+        # 没有直接 l_f_meta.backwards(), 这样会一并更新 vnet，因为想只更新 meta_model.params()
+
+        # zero the model param grads
+        meta_model.zero_grad()
         grads = torch.autograd.grad(  # return backward grads
             l_f_meta,  # outputs
-            (meta_model.params()),  # which the gradient will be returned，计算 meta_model 参数 grad
-            create_graph=True  # 高阶导数，保留求导的 graph?
-            # graph of the derivative will be constructed, allowing to compute higher order derivative products.
+            (meta_model.params()),  # inputs, graph leaves
+            create_graph=True,
+            # retain_graph=True,  # Defaults to the value of create_graph. 通常 False
+            only_inputs=True,
         )
 
         # 先调整 lr，再更新 meta_model 参数
@@ -151,15 +161,16 @@ def train_mw(train_loader, validation_loader,
         # Updating parameters of Meta-Weight-Net
         # vnet, meta-learned global params
 
-        # meta data: validation_loader
-        input_validation, target_validation = next(iter(validation_loader))
-        input_validation_var = to_var(input_validation, requires_grad=False)
-        target_validation_var = to_var(target_validation, requires_grad=False)
-        y_g_hat = meta_model(input_validation_var)
-        l_g_meta = F.cross_entropy(y_g_hat, target_validation_var)
+        # meta data: valid_loader
+        val_input, val_target = next(iter(valid_loader))
+        val_input_var = to_var(val_input, requires_grad=False)
+        val_target_var = to_var(val_target, requires_grad=False)
+
+        y_g_hat = meta_model(val_input_var)
+        l_g_meta = F.cross_entropy(y_g_hat, val_target_var)
 
         # acc on meta data
-        prec_meta = accuracy(y_g_hat.data, target_validation_var.data, topk=(1,))[0]
+        prec_meta = accuracy(y_g_hat.data, val_target_var.data, topk=(1,))[0]
 
         # 优化 vnet, fixed lr 1e-5
         optimizer_c.zero_grad()
@@ -170,7 +181,7 @@ def train_mw(train_loader, validation_loader,
         # Updating parameters of classifier network
 
         y_f = model(input_var)  # [100,10]
-        cost_w = F.cross_entropy(y_f, target_var, reduce=False)
+        cost_w = F.cross_entropy(y_f, target_var, reduction='none')
         cost_v = torch.reshape(cost_w, (len(cost_w), 1))
 
         # acc on train data
@@ -207,6 +218,8 @@ def train_mw(train_loader, validation_loader,
             'train_acc': top1.avg
         }, global_step=begin_step + i)
 
+        # total_t += time.time() - t1
+
         # idx in trainloader
         if i % print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
@@ -216,6 +229,9 @@ def train_mw(train_loader, validation_loader,
                   'meta_Prec@1 {meta_top1.val:.3f} ({meta_top1.avg:.3f})'.format(
                 epoch, i, len(train_loader),
                 loss=losses, meta_loss=meta_losses, top1=top1, meta_top1=meta_top1))
+
+            # print('each iteration time:', total_t / print_freq)
+            # total_t = 0
 
 
 # MW-fixed
@@ -277,10 +293,13 @@ def train_base(train_loader, model,
     model.train()
 
     begin_step = (epoch - 1) * len(train_loader)
+    # total_t = 0
 
     for i, (input, target) in enumerate(train_loader):
         input_var = to_var(input, requires_grad=False)
         target_var = to_var(target, requires_grad=False)
+
+        # t1 = time.time()
 
         output = model(input_var)
         loss = criterion(output, target_var)  # reduction='mean', [1,]
@@ -298,9 +317,15 @@ def train_base(train_loader, model,
         writer.add_scalar('Train/loss', losses.avg, global_step=begin_step + i)
         writer.add_scalar('Train/top1_acc', top1.avg, global_step=begin_step + i)
 
+        # total_t += time.time() - t1
+
         # idx in trainloader
         if i % print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
                 epoch, i, len(train_loader), loss=losses, top1=top1))
+
+            # print('each iteration time:', total_t / print_freq)
+            # total_t = 0
+

@@ -8,6 +8,7 @@ import random
 import copy
 import numpy as np
 from pprint import pprint
+import time
 
 import torch
 import torch.nn as nn
@@ -127,9 +128,11 @@ if __name__ == '__main__':
         adjust_learning_rate(args.lr, optimizer_a, epoch)
 
         # train on (imb_train_data)
+        begin_t = time.time()  # train_base 内部变量覆盖
         train_base(imbalanced_train_loader, model, criterion,
                    optimizer_a,
                    epoch, args.print_freq, writer)
+        print('batch time:', time.time() - begin_t)
 
         # evaluate on validation set
         prec1 = validate(test_loader, model, criterion,
