@@ -1,6 +1,5 @@
 import torch.nn as nn
 from net.meta_modules import MetaModule, MetaLinear
-from utils import load_model
 
 
 class VNet(MetaModule):
@@ -15,9 +14,3 @@ class VNet(MetaModule):
         x = self.relu1(x)
         out = self.linear2(x)
         return out.sigmoid_()
-
-
-def load_vnet(ckpt_path):
-    vnet = VNet(1, 100, 1).cuda()
-    vnet = load_model(vnet, ckpt_path=ckpt_path)
-    return vnet

@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset.data_utils import get_imb_meta_test_datasets
 from net.resnet import build_model
 from net.vnet import VNet
-from engine import adjust_learning_rate, validate, train_mw
+from engine import *
 from utils import get_curtime, save_model
 from plt_vnet import get_vnet_map
 
@@ -54,10 +54,10 @@ parser.add_argument('--tag', default='exp', type=str,
                     help='experiment tag to create tensorboard, model save dir name')
 
 params = [
-    '--dataset', 'cifar10',
-    '--num_classes', '10',
+    '--dataset', 'cifar100',
+    '--num_classes', '100',
     '--imb_factor', '50',
-    '--tag', 'mw'
+    '--tag', 'mw_v1'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
@@ -89,6 +89,12 @@ test_loader = DataLoader(test_dataset,
                          shuffle=False, **kwargs)
 print('load imb dataset done!')
 
+"""
+Meta-Weight-Net v1
+- features before softmax as vnet input. [logits]
+- VNet(num_classes, 100, 1)
+"""
+
 if __name__ == '__main__':
     # 定义 2个 model
     # classifier: meta ResNet32
@@ -96,8 +102,8 @@ if __name__ == '__main__':
     optimizer_a = torch.optim.SGD(model.params(), args.lr,  # lr 阶段性变化
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
-    # Meta-Weight net, MLP
-    vnet = VNet(1, 100, 1).cuda()
+    # v1: logits as vnet input
+    vnet = VNet(args.num_classes, 100, 1).cuda()
     optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
@@ -121,18 +127,18 @@ if __name__ == '__main__':
         adjust_learning_rate(args.lr, optimizer_a, epoch)
 
         # meta train on (imb_train_data, meta_data)
-        train_mw(imb_train_loader, valid_loader,
-                 model, vnet,
-                 args.lr,
-                 optimizer_a, optimizer_c,
-                 epoch, args.print_freq, writer)
+        train_mw_v1(imb_train_loader, valid_loader,
+                    model, vnet,
+                    args.lr,
+                    optimizer_a, optimizer_c,
+                    epoch, args.print_freq, writer)
 
         # save vnet loss-weight map each epoch
-        with torch.no_grad():
-            x, y = get_vnet_map(vnet)
-            curves_data.append((x, y))
-            curves_data_npy = np.array(curves_data).squeeze()
-            np.save(f'npy/{exp}_curves_data.npy', curves_data_npy)  # (100, 2, 100)
+        # with torch.no_grad():
+        #     x, y = get_vnet_map(vnet)
+        #     curves_data.append((x, y))
+        #     curves_data_npy = np.array(curves_data).squeeze()
+        #     np.save(f'npy/{exp}_curves_data.npy', curves_data_npy)  # (100, 2, 100)
 
         # evaluate on validation set
         prec1 = validate(test_loader, model, criterion,

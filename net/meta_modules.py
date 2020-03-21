@@ -43,7 +43,7 @@ class MetaModule(nn.Module):
                 name_t, param_t = tgt
                 if first_order:
                     grad = to_var(grad.detach().data)  # 从2阶计算图 拿到 1阶?
-                tmp = param_t - lr_inner * grad  # 手动更新
+                tmp = param_t - lr_inner * grad  # sgd, 不是 adam
                 self.set_param(self, name_t, tmp)
         else:
             for name, param in self.named_params(self):

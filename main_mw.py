@@ -16,12 +16,12 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset.data_utils import build_dataset, get_cls_img_idxs_dict, get_img_num_per_cls
+from dataset.data_utils import get_imb_meta_test_datasets
 from net.resnet import build_model
 from net.vnet import VNet
-from engine import adjust_learning_rate, validate, train_mw
+from engine import *
 from utils import get_curtime, save_model
-from plt_vnet import get_loss_weight_map
+from plt_vnet import get_vnet_map
 
 # parse arguments, args 默认会把参数名中 '-' 转成 '_'
 parser = argparse.ArgumentParser(description='Imbalanced Example')
@@ -54,71 +54,55 @@ parser.add_argument('--tag', default='exp', type=str,
                     help='experiment tag to create tensorboard, model save dir name')
 
 params = [
-    '--dataset', 'cifar10',
-    '--num_classes', '10',
-    '--imb_factor', '100',
+    '--dataset', 'cifar100',
+    '--num_classes', '100',
+    '--imb_factor', '50',
     '--tag', 'mw'
 ]
 args = parser.parse_args(params)
 pprint(vars(args))
 
-kwargs = {'num_workers': 4, 'pin_memory': True}
 use_cuda = not args.no_cuda and torch.cuda.is_available()
 
-# 增加复现性，因为 build_dataset 内用到 np.random.shuffle
-torch.manual_seed(args.seed)
 device = torch.device("cuda" if use_cuda else "cpu")
 cudnn.benchmark = True
 
-# same to torchvision.datasets.CIFAR10 class, but data has been split by num_meta
-train_meta_dataset, train_dataset, test_dataset = build_dataset(args.dataset, args.num_meta)
-
-# make imbalanced data
-torch.manual_seed(args.seed)
-classe_labels = range(args.num_classes)
-
-# 每个 cls 对应的 img idxs list, dict{cls_idx : img_id_list, ..}
-data_list = get_cls_img_idxs_dict(train_dataset.targets, args.num_classes)
-
-# 指数不平衡 imb_factor = 10
-img_num_list = get_img_num_per_cls(args.dataset, args.imb_factor, args.num_meta * args.num_classes)
-# [5000, 3871, 2997, 2320, 1796, 1391, 1077, 834, 645, 500]
-
-idx_to_del = []  # 存储各类 要 del 的 img idxs
-for cls_idx, img_id_list in data_list.items():
-    random.shuffle(img_id_list)
-    img_num = img_num_list[int(cls_idx)]
-    idx_to_del.extend(img_id_list[img_num:])  # 除去 imb 指定的，剩下的全部删去
-
-# build imbalance dataset
-imb_train_dataset = copy.deepcopy(train_dataset)
-# 删除各类取 imb_train_dataset 后剩下的
-imb_train_dataset.data = np.delete(train_dataset.data, idx_to_del, axis=0)
-imb_train_dataset.targets = np.delete(train_dataset.targets, idx_to_del, axis=0)
+# random.shuffle 重现
+# torch.manual_seed(args.seed)  # not work!!!
+random.seed(args.seed)
+imb_train_dataset, meta_train_dataset, test_dataset = get_imb_meta_test_datasets(
+    args.dataset, args.num_classes, args.num_meta, args.imb_factor
+)
 
 # imb_train/valid_meta/test
-imbalanced_train_loader = DataLoader(imb_train_dataset,
-                                     batch_size=args.batch_size,
-                                     shuffle=True, **kwargs)
-valid_loader = DataLoader(train_meta_dataset,  # 总共 10*10=100
+kwargs = {'num_workers': 4, 'pin_memory': True}
+imb_train_loader = DataLoader(imb_train_dataset,
+                              batch_size=args.batch_size,
+                              drop_last=True,
+                              shuffle=True, **kwargs)
+valid_loader = DataLoader(meta_train_dataset,  # 总共 10*10=100
                           batch_size=args.batch_size,  # 100
+                          drop_last=True,
                           shuffle=True, **kwargs)
 test_loader = DataLoader(test_dataset,
                          batch_size=args.batch_size,
                          shuffle=False, **kwargs)
 print('load imb dataset done!')
 
+"""
+Meta-Weight-Net
+- Regression problem, one for one, loss-weight is a function
+- scalar loss as vnet input
+"""
+
 if __name__ == '__main__':
     # 定义 2个 model
     # classifier: meta ResNet32
     model = build_model(args.dataset).cuda()
-    meta_model = build_model(args.dataset).cuda()
     optimizer_a = torch.optim.SGD(model.params(), args.lr,  # lr 阶段性变化
                                   momentum=args.momentum, nesterov=args.nesterov,
                                   weight_decay=args.weight_decay)
-
-    # Meta-Weight net, MLP, loss-weight map
-    # input 1, hidden 100, output 1
+    # Meta-Weight net, MLP
     vnet = VNet(1, 100, 1).cuda()
     optimizer_c = torch.optim.SGD(vnet.params(), 1e-5,  # lr 不变
                                   momentum=args.momentum, nesterov=args.nesterov,
@@ -128,13 +112,11 @@ if __name__ == '__main__':
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}'
-    dirname = f'{exp}_{get_curtime()}'
-    print('exp:', dirname)
-    # mw_cifar10_imb10_Mar05_23-03-29
+    exp = f'{args.tag}_{args.dataset}_imb{args.imb_factor}_{get_curtime()}'
+    print('exp:', exp)
 
-    writer = SummaryWriter(log_dir=os.path.join('runs', dirname))
-    model_save_dir = os.path.join('output', dirname)
+    writer = SummaryWriter(log_dir=os.path.join('runs', exp))
+    model_save_dir = os.path.join('output', exp)
     os.makedirs(model_save_dir, exist_ok=True)
 
     best_prec1, best_epoch = 0, 0
@@ -144,20 +126,19 @@ if __name__ == '__main__':
         # 调整 classifier optimizer 的 lr = meta_lr
         adjust_learning_rate(args.lr, optimizer_a, epoch)
 
-        t1 = time.time()
         # meta train on (imb_train_data, meta_data)
-        train_mw(imbalanced_train_loader, valid_loader,
+        train_mw(imb_train_loader, valid_loader,
                  model, vnet,
                  args.lr,
                  optimizer_a, optimizer_c,
                  epoch, args.print_freq, writer)
-        print('batch time:', time.time() - t1)
 
         # save vnet loss-weight map each epoch
         with torch.no_grad():
-            x, y = get_loss_weight_map(vnet)
+            x, y = get_vnet_map(vnet)
             curves_data.append((x, y))
-            print('len(curves) =', len(curves_data))
+            curves_data_npy = np.array(curves_data).squeeze()
+            np.save(f'npy/{exp}_curves_data.npy', curves_data_npy)  # (100, 2, 100)
 
         # evaluate on validation set
         prec1 = validate(test_loader, model, criterion,
@@ -170,9 +151,5 @@ if __name__ == '__main__':
                        model, epoch, best_prec1)
             save_model(os.path.join(model_save_dir, 'vnet_epoch_{}.pth'.format(epoch)),
                        vnet, epoch, best_prec1)
-
-    curves_data = np.array(curves_data)
-    curves_data = curves_data.squeeze(-1)
-    np.save(f'npy/{exp}_curves_data.npy', curves_data)  # (100, 2, 100)
 
     print('Best accuracy: {}, epoch: {}'.format(best_prec1, best_epoch))
