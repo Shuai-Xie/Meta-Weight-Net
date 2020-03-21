@@ -54,9 +54,9 @@ parser.add_argument('--tag', default='exp', type=str,
                     help='experiment tag to create tensorboard, model save dir name')
 
 params = [
-    '--dataset', 'cifar100',
-    '--num_classes', '100',
-    '--imb_factor', '50',
+    '--dataset', 'cifar10',
+    '--num_classes', '10',
+    '--imb_factor', '100',
     '--tag', 'mw'
 ]
 args = parser.parse_args(params)
